@@ -1,2 +1,4 @@
 tests/
 tm-sim
+callgrind*
+out.txt
