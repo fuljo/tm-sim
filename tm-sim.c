@@ -1,22 +1,54 @@
+/** -----------------------------
+  *   TURING MACHINE SIMULATOR
+  * -----------------------------
+  * (c) 2018 Alessandro Fulgini. All rights reserved
+  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <stdbool.h>
 
-#ifdef DEBUG
-  #define LOG(args...) printf(args)
-# else
-  #define LOG(args...)
-#endif
-
 #define STR_LEN 4
-#define PAGE_SIZE 256
+#define PAGE_SIZE 64
 #define MAX_SIZE_LINEAR_SEARCH 4
 #define INITIAL_STATE 0
 #define BLANK '_'
 #define SYM_ACCEPT '1'
 #define SYM_REFUSE '0'
 #define SYM_UNDET 'U'
+
+#ifdef DEBUG
+  #define LOG(args...) printf(args)
+  #define LOG_STATUS(tm, b) {\
+    if(b->tr != NULL) {\
+      printf("STATUS: %d, %c -> %d, %c, %c\n",\
+        (int) (b->state - tm->states), head_read(b),\
+        b->tr->state, b->tr->output, b->tr->move);\
+    }\
+  }
+  #define LOG_TAPE(b) {\
+    if(b->tr != NULL) {\
+      printf("TAPE: ");\
+      page_t * p = b->first_page;\
+      int i = 0;\
+      while (p != NULL) {\
+        printf("%c", p->mem[i]);\
+        if (p == b->head_page && i == b->head_pos) {\
+          printf("!");\
+        }\
+        i++;\
+        if (i == PAGE_SIZE) {\
+          i = 0;\
+          p = p->next;\
+        }\
+      }\
+      printf("\n");\
+    }\
+  }
+# else
+  #define LOG(args...)
+#endif
 
 /**
   * TYPE DEFINITIONS
@@ -33,8 +65,8 @@ typedef struct turing_machine tm_t;
 
 /* Structure for general turing machine information */
 struct turing_machine {
-  unsigned int max_state; /* Highest state number */
-  unsigned int max_steps; /* Maximum steps per-branch */
+  int max_state; /* Highest state number */
+  int max_steps; /* Maximum steps per-branch */
   rq_t * rq; /* Top of runqueue */
   state_t * states; /* [0...max_state] vector */
 };
@@ -43,15 +75,15 @@ struct turing_machine {
 struct state {
   bool is_acc;
   bool is_reachable; /* Does the state appear in the right part of any tr? */
-  unsigned int tr_inputs_count;
+  int tr_inputs_count;
   tr_input_t * tr_inputs; /* [0...tr_inputs_count] vector of
                               <input,tr_output> entries */
 };
 
 /* Temporary structure for state information during input file loading */
 struct state_temp {
-  unsigned int number; /* The state number */
-  unsigned char tr_inputs_count;
+  int number; /* The state number */
+  int tr_inputs_count;
   tr_output_t * tr_inputs[UCHAR_MAX + 1]; /* [0...UCHAR_MAX] vector of
                               <tr_output> list heads , indexed by char */
   /* Links to previous and next states in the list */
@@ -67,7 +99,7 @@ struct tr_input {
 
 /* Structure for transition's output (right part) */
 struct tr_output {
-  unsigned int state; /* Next state */
+  int state; /* Next state */
   char output;
   char move; /* Can either be L, S, R */
   tr_output_t * next; /* Link to next transition */
@@ -126,7 +158,7 @@ page_t * page_create(page_t * prev, page_t * next, bool private, char * mem);
 void page_destroy(page_t * page);
 void page_make_private(page_t * page);
 
-branch_t * branch_clone(branch_t * parent);
+branch_t * branch_clone(branch_t * parent, tr_output_t * tr);
 void branch_memcpy(branch_t * branch, branch_t * parent);
 void branch_destroy(branch_t * branch);
 
@@ -145,7 +177,7 @@ char tm_run(tm_t * tm);
 char tm_compute_rq(tm_t * tm);
 state_t * tm_step(tm_t * tm, branch_t * b);
 
-tr_output_t * search_tr_out(tr_input_t * v, unsigned int size, char key);
+tr_output_t * search_tr_out(tr_input_t * v, int p, int r, char key);
 
 /**
   * MAIN
@@ -175,16 +207,14 @@ int main() {
   reads = scanf("%d", &tm.max_steps); /* Read max steps number */
   if (reads) getchar(); /* Flush endline */
 
-  /* SIMULATE ON INPUT */
+  /* 5. Simulate on input */
   reads = scanf("%s", s); /* Read the "max" string */
-  getchar(); /* Flush endline */
   while ((res = getchar()) != EOF) {
-    ungetc(res, stdin);
     res = tm_run(&tm);
     printf("%c\n", res);
   }
 
-  /* CLEAN MEMORY */
+  /* 6. Clean memory */
   tm_destroy(&tm);
   return 0;
 }
@@ -204,11 +234,11 @@ void tm_destroy(tm_t * tm) {
   state_t * s;
   tr_output_t *tr, *tr_next;
   /* Delete each state */
-  for (unsigned int i = 0; i <= tm->max_state; i++) {
+  for (int i = 0; i <= tm->max_state; i++) {
     s = &tm->states[i];
 
     /* Delete the output transition list for each input */
-    for (unsigned int j = 0; j < s->tr_inputs_count; j++) {
+    for (int j = 0; j < s->tr_inputs_count; j++) {
       tr = s->tr_inputs[j].transitions;
       while (tr != NULL) {
         tr_next = tr->next;
@@ -279,7 +309,7 @@ void load_transitions(tm_t* tm) {
   /* First allocate the states array */
   tm->states = (state_t *) malloc((tm->max_state + 1) * sizeof(state_t));
   /* Initialise it */
-  for (unsigned int i = 0; i <= tm->max_state; i++) {
+  for (int i = 0; i <= tm->max_state; i++) {
     s = &tm->states[i];
     s->is_acc = false;
     s->is_reachable = i == INITIAL_STATE;
@@ -312,8 +342,6 @@ void load_transitions(tm_t* tm) {
         c++;
       }
     }
-    LOG("DEBUG: tr_input for state %d: %d/%d\n",
-          c_state->number, c, s->tr_inputs_count);
     c_state = c_state->next;
   }
 
@@ -443,15 +471,12 @@ void state_temp_add_transition(
   tr->next = state->tr_inputs[(unsigned char)input];
   state->tr_inputs[(unsigned char)input] = tr;
 
-  LOG("DEBUG: Creating new transition: %d,%c -> %d,%c,%c\tchars_count: %d\n",
-    state->number, input, tr->state, tr->output, tr->move,
-    state->tr_inputs_count);
   return;
 }
 
 /* Creates and initialises a memory page */
 page_t * page_create(page_t * prev, page_t * next, bool private, char * mem) {
-  LOG("DEBUG: Creating new page\n");
+  LOG("DEBUG: Creating new page: %p\t%p\t%d\n", prev, next, private);
   page_t * p = (page_t *) malloc(sizeof(page_t));
   p->prev = prev;
   p->next = next;
@@ -476,7 +501,7 @@ void page_destroy(page_t * page) {
 
 /* Copy the page's shared memory to a new private memory */
 void page_make_private(page_t * page) {
-  LOG("DEBUG: Making private page");
+  LOG("DEBUG: Making private page\n");
   char * old_mem = page->mem;
   page->mem = (char *) malloc(PAGE_SIZE * sizeof(char));
   page->private = true;
@@ -488,7 +513,7 @@ void page_make_private(page_t * page) {
 }
 
 /* Creates a new branch from its parent, does not duplicate memory */
-branch_t * branch_clone(branch_t * parent) {
+branch_t * branch_clone(branch_t * parent, tr_output_t * tr) {
   branch_t * b;
 
   /* Allocate structure */
@@ -499,6 +524,7 @@ branch_t * branch_clone(branch_t * parent) {
   b->state = parent->state;
   b->head_pos = parent->head_pos;
   b->steps = parent->steps;
+  b->tr = tr;
 
   /* Initialise memory to NULL, it will be derived from parent when branch
       is evaluated */
@@ -526,7 +552,7 @@ void branch_memcpy(branch_t * branch, branch_t * parent) {
     if (p_child->prev != NULL) {
       p_child->prev->next = p_child; /* Link next to previous */
     } else {
-      branch->first_page = p_child->prev; /* First page */
+      branch->first_page = p_child; /* First page */
     }
 
     /* Set the same head page */
@@ -558,22 +584,29 @@ void branch_destroy(branch_t * branch) {
 }
 
 /* Return output transition list */
-tr_output_t * search_tr_out(tr_input_t * v, unsigned int size, char key) {
-  if (size <= MAX_SIZE_LINEAR_SEARCH) {
+tr_output_t * search_tr_out(tr_input_t * v, int p, int r, char key) {
+  if (r < p || key < v[p].input || key > v[r].input) {
+    return NULL;
+  }
+  if ((r - p) <= MAX_SIZE_LINEAR_SEARCH) {
     /* Use linear search */
-    for (unsigned int i = 0; i < size; i++) {
-      if (v[i].input == key) {
-        return v[i].transitions;
+    while(p <= r) {
+      if (v[p].input == key) {
+        return v[p].transitions;
       }
+      p++;
     }
     return NULL;
   } else {
     /* Binary search */
-    unsigned int mid = size/2;
+    int mid = p + (r - p)/2;
+    if (v[mid].input == key) {
+      return v[mid].transitions;
+    }
     if(v[mid].input > key) {
-      return search_tr_out(v, mid + 1, key); /* First half */
+      return search_tr_out(v, p, mid - 1, key); /* First half */
     } else {
-      return search_tr_out(&v[mid + 1], size - 1, key); /* Second half */
+      return search_tr_out(v, mid + 1 , r, key); /* Second half */
     }
   }
 }
@@ -589,6 +622,7 @@ char tm_run(tm_t * tm) {
   root->head_page = root->first_page = NULL; /* Will cause page fault */
   root->head_pos = root->first_pos = root->last_pos = 0;
   root->steps = 0;
+  root->tr = NULL;
   if (tm->states != NULL) { /* Set initial state */
     root->state = &tm->states[INITIAL_STATE];
   } else {
@@ -598,11 +632,12 @@ char tm_run(tm_t * tm) {
 
   /* 2. Load the input string */
   c = getchar();
-  while (c != '\n') { /* Read the string till the end */
+  while (c != '\n' && c != EOF) { /* Read the string till the end */
     head_write(root, c);
     head_move(root, 'R');
     c = getchar();
   }
+  ungetc(c, stdin); /* Put back the line terminator */
   /* Reset head's position */
   root->head_page = root->first_page;
   root->head_pos = 0;
@@ -640,6 +675,8 @@ char tm_compute_rq(tm_t * tm) {
         return SYM_UNDET;
       }
     } else { /* No preemption => execute transition */
+      LOG_STATUS(tm, tm->rq->branch);
+      LOG_TAPE(tm->rq->branch);
       s = tm_step(tm, tm->rq->branch);
       if (s != NULL) { /* Machine halted in this state */
         if (s->tr_inputs_count == 0) { /* It is a final state */
@@ -672,6 +709,8 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
 
   /* Execute given transition */
   if (b->tr != NULL) {
+    LOG("DEBUG: Doing transition -> %d, %c, %c\n",
+      b->tr->state, b->tr->output, b->tr->move);
     s = &tm->states[b->tr->state]; /* Save next state */
 
     /* If we come from a non-deterministic transition, copy parent's memory */
@@ -690,9 +729,10 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
   /* Look for the next transition(s) */
   s = b->state; /* Save current state */
   input = head_read(b); /* Read input */
-  tr_next = search_tr_out(s->tr_inputs, s->tr_inputs_count, input);
+  tr_next = search_tr_out(s->tr_inputs, 0, s->tr_inputs_count - 1, input);
 
   if (tr_next == NULL) { /* Machine needs to halt */
+    LOG("DEBUG: Reached halt state\n");
     return s; /* Returns the halt state */
   }
 
@@ -706,7 +746,7 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
     */
   tr_next = tr_next->next;
   while (tr_next != NULL) {
-    b_child = branch_clone(b); /* Clone and set nd_parent */
+    b_child = branch_clone(b, tr_next); /* Clone and set nd_parent */
     rq_push(&tm->rq, b_child); /* Insert on top of runqueue */
     tr_next = tr_next->next;
   }
@@ -748,7 +788,7 @@ void head_move(branch_t * b, char move) {
   /* TODO: Set up garbage collector */
   if (b->head_page != NULL) {
     if (move == 'L') {
-      if (b->head_page->prev == NULL) { /* Left page fault */
+      if (b->head_page->prev == NULL && b->head_pos == 0) { /* Left page fault */
         /* Create the new page an mark it private */
         b->head_page->prev = page_create(NULL, b->head_page, true, NULL);
         b->first_page = b->head_page->prev;
@@ -760,7 +800,7 @@ void head_move(branch_t * b, char move) {
         b->head_pos--;
       }
     } else if (move == 'R') {
-      if (b->head_page->next == NULL) { /* Right page fault */
+      if (b->head_page->next == NULL && b->head_pos == PAGE_SIZE - 1) { /* Right page fault */
         /* Create the new page an mark it private */
         b->head_page->next = page_create(b->head_page, NULL, true, NULL);
       }
