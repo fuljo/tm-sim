@@ -14,6 +14,9 @@
 #define MAX_SIZE_LINEAR_SEARCH 4
 #define INITIAL_STATE 0
 #define BLANK '_'
+#define SYM_ACCEPT '1'
+#define SYM_REFUSE '0'
+#define SYM_UNDET 'U'
 
 /**
   * TYPE DEFINITIONS
@@ -131,15 +134,16 @@ char head_read(branch_t * b);
 void head_write (branch_t * b, char c);
 void head_move(branch_t * b, char c);
 
-rq_t * rq_push(rq_t * rq, branch_t * b);
-rq_t * rq_pop(rq_t * rq);
+void rq_push(rq_t ** rq, branch_t * b);
+branch_t * rq_pop(rq_t ** rq);
 
 void load_transitions(tm_t * tm);
 void load_acc(tm_t * tm);
 void load_string(branch_t * b);
 
-state_t * tm_step(tm_t * tm, branch_t * b);
 char tm_run(tm_t * tm);
+char tm_compute_rq(tm_t * tm);
+state_t * tm_step(tm_t * tm, branch_t * b);
 
 tr_output_t * search_tr_out(tr_input_t * v, unsigned int size, char key);
 
@@ -148,6 +152,7 @@ tr_output_t * search_tr_out(tr_input_t * v, unsigned int size, char key);
   */
 int main() {
   int reads;
+  char res;
   /* LOAD MACHINE CONFIGURATION */
 
   /* 1. Create turing machine instance */
@@ -171,6 +176,13 @@ int main() {
   if (reads) getchar(); /* Flush endline */
 
   /* SIMULATE ON INPUT */
+  reads = scanf("%s", s); /* Read the "max" string */
+  getchar(); /* Flush endline */
+  while ((res = getchar()) != EOF) {
+    ungetc(res, stdin);
+    res = tm_run(&tm);
+    printf("%c\n", res);
+  }
 
   /* CLEAN MEMORY */
   tm_destroy(&tm);
@@ -439,7 +451,7 @@ void state_temp_add_transition(
 
 /* Creates and initialises a memory page */
 page_t * page_create(page_t * prev, page_t * next, bool private, char * mem) {
-  LOG("DEBUG: Creating new page");
+  LOG("DEBUG: Creating new page\n");
   page_t * p = (page_t *) malloc(sizeof(page_t));
   p->prev = prev;
   p->next = next;
@@ -566,26 +578,84 @@ tr_output_t * search_tr_out(tr_input_t * v, unsigned int size, char key) {
   }
 }
 
-/** EXECUTION STRATEGY:
-  * - The first branch gets enqueued with b->tr = NULL
-  *   this causes tm_step to look for the first transition(s)
-  * - When tm_step is called, it performs this steps:
-  *   + if b->nd_parent != NULL it copies the memory from his parent
-  *   + if b->tr != NULL it executes the given transition (which is only one)
-  *   + Then it looks for the next transition(s) from the acutal state:
-  *     - if there are no transitions, the machine returns the current state
-  *       if it is final (acc or non-acc)
-  *     - if there are transition(s), the first one is set as
-  *       b->tr and the branch remains in the queue;
-  *       if there are other (non-deterministic) transitions,
-  *       they are pushed in the cue and b->nd_father is set to take
-  *       their parent's memory.
-  *       If during the push process we find a transition which leads to
-  *       a halt state, the function returns the halt state
-  * - If tm_step returns NULL, the branch at the top of the rq is executed,
-  *   if it returns the halt state, the entire runqueue is destroyed
-  *   and the response is given
-  */
+/* Computes one string from stdin and returns the response 0, 1, U */
+char tm_run(tm_t * tm) {
+  branch_t *root, *b;
+  char c;
+
+  /* 1. Create the "root" branch */
+  root = malloc(sizeof(branch_t));
+  root->nd_parent = NULL;
+  root->head_page = root->first_page = NULL; /* Will cause page fault */
+  root->head_pos = root->first_pos = root->last_pos = 0;
+  root->steps = 0;
+  if (tm->states != NULL) { /* Set initial state */
+    root->state = &tm->states[INITIAL_STATE];
+  } else {
+    LOG("ERROR: The machine has no states");
+    return SYM_REFUSE;
+  }
+
+  /* 2. Load the input string */
+  c = getchar();
+  while (c != '\n') { /* Read the string till the end */
+    head_write(root, c);
+    head_move(root, 'R');
+    c = getchar();
+  }
+  /* Reset head's position */
+  root->head_page = root->first_page;
+  root->head_pos = 0;
+
+  /* 3. Run the computation */
+  rq_push(&tm->rq, root);
+  c = tm_compute_rq(tm);
+
+  /* 4. Empty the runqueue */
+  while(tm->rq != NULL) {
+    b = rq_pop(&tm->rq);
+    branch_destroy(b);
+  }
+
+  /* Return evaluation */
+  return c;
+}
+
+/* Execute the runqueue until it's empty or a final state is reached */
+/* Return code: 0: refuse, 1: accept, U: undetermined */
+char tm_compute_rq(tm_t * tm) {
+  branch_t * b;
+  state_t * s;
+
+  while (tm->rq != NULL) {
+    b = tm->rq->branch; /* Branch to be executed */
+
+    if (b->steps == tm->max_steps){ /* Check if preemption is needed */
+      /* Preempt the branch */
+      rq_pop(&tm->rq);
+      branch_destroy(b);
+      /* Result is undetermined if the last computation
+         ends because of preemption */
+      if (tm->rq == NULL) {
+        return SYM_UNDET;
+      }
+    } else { /* No preemption => execute transition */
+      s = tm_step(tm, tm->rq->branch);
+      if (s != NULL) { /* Machine halted in this state */
+        if (s->tr_inputs_count == 0) { /* It is a final state */
+          return s->is_acc ? SYM_ACCEPT : SYM_REFUSE;
+        } else { /* The transition is simply undefined */
+          /* This branch has terminated */
+          rq_pop(&tm->rq);
+          branch_destroy(b);
+        }
+      }
+    }
+  }
+
+  /* If we got here, computation has finished with no final states */
+  return SYM_REFUSE;
+}
 
 /** Takes in a branch from the queue, if needed copies memory from parent.
   * Then executes the given transition, if any.
@@ -637,7 +707,8 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
   tr_next = tr_next->next;
   while (tr_next != NULL) {
     b_child = branch_clone(b); /* Clone and set nd_parent */
-    tm->rq = rq_push(tm->rq, b_child); /* Insert on top of runqueue */
+    rq_push(&tm->rq, b_child); /* Insert on top of runqueue */
+    tr_next = tr_next->next;
   }
 
   return NULL; /* Next branch in the runqueue will be executed */
@@ -703,20 +774,25 @@ void head_move(branch_t * b, char move) {
   } /* If there is no page allocated, just do nothing */
 }
 
-/* Adds a branch on top of the runqueue, returns top of runqueue */
-rq_t * rq_push(rq_t * rq, branch_t * b) {
+/* Adds a branch on top of the runqueue */
+void rq_push(rq_t ** rq, branch_t * b) {
   rq_t * new = malloc(sizeof(rq_t));
   new->branch = b;
-  new->next = rq;
-  return new;
+  new->next = *rq;
+  *rq = new;
 }
 
-/* Removes an element from the top of the runqueue and returns it */
-rq_t * rq_pop(rq_t * rq) {
-  rq_t * rq_top = rq;
-  if (rq != NULL) {
-    rq = rq->next;
-    free(rq_top);
+/* Removes a branch from the top of the runqueue and returns it */
+branch_t * rq_pop(rq_t ** rq) {
+  rq_t * elem;
+  branch_t * b;
+  if (*rq != NULL) {
+    elem = *rq;
+    b = elem->branch;
+    *rq = (*rq)->next;
+    free(elem);
+    return b;
+  } else {
+    return NULL;
   }
-  return rq;
 }
