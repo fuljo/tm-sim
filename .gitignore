@@ -1,4 +1,5 @@
 tests/
 tm-sim
 callgrind*
+massif*
 out.txt
