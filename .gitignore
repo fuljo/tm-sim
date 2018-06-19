@@ -1,4 +1,5 @@
 tests/
+test.sh
 tm-sim
 callgrind*
 massif*
