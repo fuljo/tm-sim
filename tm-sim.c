@@ -27,9 +27,13 @@
         b->tr->state, b->tr->output, b->tr->move);\
     }\
   }
-  #define LOG_TAPE(b) {\
+  #define LOG_TAPE(branch) {\
+    branch_t * b = branch;\
     if(b->tr != NULL) {\
       printf("TAPE: ");\
+      if (b->nd_parent != NULL) {\
+        b = b->nd_parent;\
+      }\
       page_t * p = b->first_page;\
       int i = 0;\
       while (p != NULL) {\
@@ -211,7 +215,9 @@ int main() {
 
   /* 5. Simulate on input */
   reads = scanf("%s", s); /* Read the "max" string */
+  getchar(); /* Flush endline */
   while ((res = getchar()) != EOF) {
+    ungetc(res, stdin);
     res = tm_run(&tm);
     printf("%c\n", res);
   }
@@ -401,6 +407,10 @@ state_temp_t * state_temp_get(
       /* Insert after c_state */
       c_state->next = state_temp_create(q, c_state, c_state->next);
       c_state = c_state->next;
+
+      if (c_state->next != NULL) { /* link to next state */
+        c_state->next->prev = c_state;
+      }
     }
   } else if(c_state->number > q){
     /* Scan the list left */
@@ -415,8 +425,9 @@ state_temp_t * state_temp_get(
       c_state->prev = state_temp_create(q, c_state->prev, c_state);
       c_state = c_state->prev;
 
-      /* Update head of list */
-      if (c_state->prev == NULL) {
+      if (c_state->prev != NULL) { /* Link to previous */
+        c_state->prev->next = c_state;
+      } else { /* Update head of list */
         *state_list = c_state;
       }
     } /* If we get here, c_state->number == q */
@@ -621,8 +632,11 @@ char tm_run(tm_t * tm) {
   /* 1. Create the "root" branch */
   root = malloc(sizeof(branch_t));
   root->nd_parent = NULL;
-  root->head_page = root->first_page = NULL; /* Will cause page fault */
-  root->head_pos = root->first_pos = root->last_pos = 0;
+  root->head_page = NULL; /* Will cause page fault */
+  root->first_page = NULL;
+  root->head_pos = 0;
+  root->first_pos = 0;
+  root->last_pos = 0;
   root->steps = 0;
   root->tr = NULL;
   if (tm->states != NULL) { /* Set initial state */
@@ -639,7 +653,6 @@ char tm_run(tm_t * tm) {
     head_move(root, 'R');
     c = getchar();
   }
-  ungetc(c, stdin); /* Put back the line terminator */
   /* Reset head's position */
   root->head_page = root->first_page;
   root->head_pos = 0;
@@ -663,6 +676,7 @@ char tm_run(tm_t * tm) {
 char tm_compute_rq(tm_t * tm) {
   branch_t * b;
   state_t * s;
+  bool has_preempted = false;
 
   while (tm->rq != NULL) {
     b = tm->rq->branch; /* Branch to be executed */
@@ -671,20 +685,18 @@ char tm_compute_rq(tm_t * tm) {
       /* Preempt the branch */
       rq_pop(&tm->rq);
       branch_destroy(b);
-      /* Result is undetermined if the last computation
-         ends because of preemption */
-      if (tm->rq == NULL) {
-        return SYM_UNDET;
-      }
+      has_preempted = true;
     } else { /* No preemption => execute transition */
       LOG_STATUS(tm, tm->rq->branch);
       LOG_TAPE(tm->rq->branch);
       s = tm_step(tm, tm->rq->branch);
       if (s != NULL) { /* Machine halted in this state */
         if (s->tr_inputs_count == 0 && s->is_acc) { /* It is an acceptance state */
+          LOG("INFO: Accepting...\n");
           return SYM_ACCEPT;
-        } else { /* The transition is undef. or the state is non-acceptance */
+        } else { /* The transition is undefined */
           /* This branch has terminated */
+          LOG("DEBUG: Dequeuing dead branch\n");
           rq_pop(&tm->rq);
           branch_destroy(b);
         }
@@ -692,8 +704,12 @@ char tm_compute_rq(tm_t * tm) {
     }
   }
 
-  /* If we got here, computation has finished with no final states */
-  return SYM_REFUSE;
+  /** If we got here, computation has finished without reaching
+    * acceptance states.
+    * If we preempted a branch at least once, the machine could have terminated
+    * so the response must be undetermined.
+    */
+  return has_preempted ? SYM_UNDET : SYM_REFUSE;
 }
 
 /** Takes in a branch from the queue, if needed copies memory from parent.
@@ -775,14 +791,19 @@ char head_read(branch_t * b) {
 void head_write(branch_t * b, char c) {
   /* First check if any page is allocated */
   if (b->head_page == NULL && c != BLANK) {
+    LOG("DEBUG: Page fault, creating first page\n");
     /* If there is no page and we're not writing a blank, create the first one */
-    b->head_page = b->first_page = page_create(NULL, NULL, true, NULL);
-  } else if (!b->head_page->private) {
-    /* If the page is shared, make a private copy of the memory */
-    page_make_private(b->head_page);
+    b->first_page = page_create(NULL, NULL, true, NULL);
+    b->head_page = b->first_page;
   }
-  /* Now write the char */
-  b->head_page->mem[b->head_pos] = c;
+  if (b->head_page->mem[b->head_pos] != c) { /* Only write if different */
+    if (!b->head_page->private) {
+      /* If the page is shared, make a private copy of the memory */
+      page_make_private(b->head_page);
+    }
+    /* Now write the char */
+    b->head_page->mem[b->head_pos] = c;
+  }
 }
 
 /* Move the head L, S, R and handle page fault */
