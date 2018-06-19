@@ -122,7 +122,6 @@ struct branch {
 
   /* Keep track of the extreme points of the tape for garbage collection */
   page_t * first_page;
-  int first_pos, last_pos;
 };
 
 /* Structure for memory page */
@@ -635,8 +634,6 @@ char tm_run(tm_t * tm) {
   root->head_page = NULL; /* Will cause page fault */
   root->first_page = NULL;
   root->head_pos = 0;
-  root->first_pos = 0;
-  root->last_pos = 0;
   root->steps = 0;
   root->tr = NULL;
   if (tm->states != NULL) { /* Set initial state */
