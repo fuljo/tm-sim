@@ -65,7 +65,6 @@ typedef struct branch branch_t;
 typedef struct runqueue rq_t;
 typedef struct tr_output tr_output_t;
 typedef struct tr_input tr_input_t;
-typedef struct state_temp state_temp_t;
 typedef struct state state_t;
 typedef struct turing_machine tm_t;
 
@@ -84,16 +83,6 @@ struct state {
   int tr_inputs_count;
   tr_input_t * tr_inputs; /* [0...tr_inputs_count] vector of
                               <input,tr_output> entries */
-};
-
-/* Temporary structure for state information during input file loading */
-struct state_temp {
-  int number; /* The state number */
-  int tr_inputs_count;
-  tr_output_t * tr_inputs[UCHAR_MAX + 1]; /* [0...UCHAR_MAX] vector of
-                              <tr_output> list heads , indexed by char */
-  /* Links to previous and next states in the list */
-  state_temp_t *prev, *next;
 };
 
 /* Structure for trainsition input->output linking */
@@ -139,20 +128,11 @@ struct runqueue {
 
 /* FUNCTION PROTOTYPES */
 tm_t tm_create();
-state_temp_t * state_temp_get(
-  state_temp_t ** state_list,
-  state_temp_t * c_state,
-  int q
-);
 void tm_destroy(tm_t * tm);
-state_temp_t * state_temp_create(
-  int q,
-  state_temp_t * prev,
-  state_temp_t * next
-);
+void tm_insert_state(int q);
 
-void state_temp_add_transition(
-  state_temp_t * state,
+void state_insert_transition(
+  state_t * state,
   char input,
   int q_out,
   char output,
@@ -182,7 +162,7 @@ char tm_run(tm_t * tm);
 char tm_compute_rq(tm_t * tm);
 state_t * tm_step(tm_t * tm, branch_t * b);
 
-tr_output_t * search_tr_out(tr_input_t * v, int p, int r, char key);
+tr_input_t * search_tr_input(tr_input_t * v, int p, int r, char key);
 
 /**
   * MAIN
@@ -232,7 +212,10 @@ tm_t tm_create() {
   tm.max_state = 0;
   tm.max_steps = 0;
   tm.rq = NULL;
-  tm.states = NULL;
+  tm.states = (state_t *) malloc(sizeof(state_t)); /* Initial state */
+  tm.states[0].tr_inputs_count = 0;
+  tm.states[0].tr_inputs = NULL;
+  tm.states[0].is_acc = false;
   return tm;
 }
 
@@ -276,90 +259,37 @@ void tm_destroy(tm_t * tm) {
   *  "(state) (input) (output) (move) (next state)"
   */
 void load_transitions(tm_t* tm) {
-  state_temp_t *state_list = NULL, *c_state = NULL;
   state_t * s;
   char input, output, move;
-  int q_in, q_out, reads;
+  int q_in, q_out, reads, max;
   do { /* Loading stops when the "acc" keyword is found */
     /* Scan the whole string */
     reads = scanf("%d %c %c %c %d", &q_in, &input, &output, &move, &q_out);
     if(reads) { /* reads = 0 means that the "tr" section is finished */
       getchar(); /* Flush newline */
-      /* Find or create the state in the list */
-      c_state = state_temp_get(&state_list, c_state, q_in);
-      if (c_state == NULL) {
-        LOG("ERROR: Could not find or create state %d\n", q_in);
+
+      /* First extend the states array if necessary */
+      max = q_in > q_out ? q_in : q_out;
+      if (max > tm->max_state) { /* Extend the size */
+        LOG("DEBUG: New status array limit: %d\n", max);
+        tm->states = (state_t *)
+                            realloc(tm->states, (max + 1) * sizeof(state_t));
+        while (tm->max_state < max) { /* Initialise new states */
+          s = &tm->states[tm->max_state + 1];
+          s->tr_inputs_count = 0;
+          s->tr_inputs = NULL;
+          s->is_acc = false;
+          tm->max_state++;
+        }
       }
-      /* Append the new transition */
-      state_temp_add_transition(c_state, input, q_out, output, move);
-      /* Update max state number */
-      if (q_in > tm->max_state) {
-        tm->max_state = q_in;
-      }
-      if (q_out > tm->max_state) {
-        tm->max_state = q_out;
-      }
+
+      /* Insert the new transition */
+      state_insert_transition(&tm->states[q_in], input, q_out, output, move);
+
     }
   } while(reads != 0);
-  #ifdef DEBUG
-    /* Log the state list */
-    LOG("INFO: States list: ");
-    c_state = state_list;
-    while (c_state != NULL) {
-      LOG("%d->", c_state->number);
-      c_state = c_state->next;
-    }
-    LOG("\n");
-  #endif
 
-  /* Now create the definitive structure */
-  /* First allocate the states array */
-  tm->states = (state_t *) malloc((tm->max_state + 1) * sizeof(state_t));
-  /* Initialise it */
-  for (int i = 0; i <= tm->max_state; i++) {
-    s = &tm->states[i];
-    s->is_acc = false;
-    s->is_reachable = i == INITIAL_STATE;
-    s->tr_inputs_count = 0;
-    s->tr_inputs = NULL;
-  }
-
-  /* Now scan the states list and transfer the information */
-  c_state = state_list;
-  while (c_state != NULL) {
-    #ifdef DEBUG
-      if (c_state->number > tm->max_state) {
-        LOG("ERROR: State %d does not exist", c_state->number);
-      }
-    #endif
-    /* Create handle to the state */
-    s = &tm->states[c_state->number];
-    /* Initialise the tr_inputs array */
-    s->tr_inputs_count = c_state->tr_inputs_count;
-    s->tr_inputs = (tr_input_t *) malloc(s->tr_inputs_count * sizeof(tr_input_t));
-    /* Now add the new transitions */
-    int c = 0; /* Current position in the array */
-
-    /* Scan the tr_inputs array in c_state and copy the
-        tr_output list from non-NULL cells */
-    for (int i = 0; i <= UCHAR_MAX; i++) {
-      if (c_state->tr_inputs[i] != NULL) {
-        s->tr_inputs[c].input = (char) i;
-        s->tr_inputs[c].transitions = c_state->tr_inputs[i];
-        c++;
-      }
-    }
-    c_state = c_state->next;
-  }
-
-  /* Clean up temporary structure */
-  c_state = state_list;
-  while (state_list != NULL) {
-    state_list = state_list->next;
-    free(c_state);
-    c_state = state_list;
-  }
-  return;
+  LOG("INFO: Max state: %d\n", tm->max_state);
 }
 
 /* Loads acceptance states */
@@ -380,110 +310,60 @@ void load_acc(tm_t * tm) {
   return;
 }
 
-/** Finds or adds a state to the temporary state list, keeping it ordered by insertion.
-  *  Since state numbers are likely to be quite-ordered in the input file,
-  *  this is more efficient than using trees in most common cases
-  */
-state_temp_t * state_temp_get(
-  state_temp_t ** state_list,
-  state_temp_t * c_state,
-  int q
-) {
-  /* First look for the state */
-  if(c_state == NULL) {
-    /* The list is empty, so create the state and append it */
-    c_state = state_temp_create(q, NULL, NULL);
-    *state_list = c_state;
-  } else if(c_state->number < q) {
-    /* Scan the list right */
-    while (c_state->next != NULL && c_state->next->number < q) {
-      c_state = c_state->next;
-    }
-    /* Next state is >=q */
-    if (c_state->next != NULL && c_state->next->number == q) {
-      c_state = c_state->next; /* Found the state */
-    } else {
-      /* Insert after c_state */
-      c_state->next = state_temp_create(q, c_state, c_state->next);
-      c_state = c_state->next;
-
-      if (c_state->next != NULL) { /* link to next state */
-        c_state->next->prev = c_state;
-      }
-    }
-  } else if(c_state->number > q){
-    /* Scan the list left */
-    while (c_state->prev != NULL && c_state->prev->number > q) {
-      c_state = c_state->prev;
-    }
-    /* Next state is <=q */
-    if (c_state->prev != NULL && c_state->prev->number == q) {
-      c_state = c_state->prev; /* Found the state */
-    } else {
-      /* Insert before c_state */
-      c_state->prev = state_temp_create(q, c_state->prev, c_state);
-      c_state = c_state->prev;
-
-      if (c_state->prev != NULL) { /* Link to previous */
-        c_state->prev->next = c_state;
-      } else { /* Update head of list */
-        *state_list = c_state;
-      }
-    } /* If we get here, c_state->number == q */
-  }
-  return c_state;
-}
-
-/* Creates and returns a state_temp instance */
-state_temp_t * state_temp_create(
-  int q,
-  state_temp_t * prev,
-  state_temp_t * next
-) {
-  state_temp_t * s;
-  s = (state_temp_t *) malloc(sizeof(state_temp_t));
-  s->number = q;
-  s->tr_inputs_count = 0;
-  /* Initialise the transitions array to NULL */
-  for (int i = 0; i <= UCHAR_MAX; i++) {
-    s->tr_inputs[i] = NULL;
-  }
-  /* Link list elements */
-  s->prev = prev;
-  s->next = next;
-  return s;
-}
-
 /* Adds transition to an existing state during input parsing */
-void state_temp_add_transition(
-  state_temp_t * state,
+void state_insert_transition(
+  state_t * s,
   char input,
   int q_out,
   char output,
   char move
 ) {
-  /* First create the transition */
-  tr_output_t * tr = (tr_output_t *) malloc(sizeof(tr_output_t));
-  tr->state = q_out;
-  tr->output = output;
-  tr->move = move;
-  tr->next = NULL;
-  #ifdef DEBUG
-    if (tr->move != 'L' && tr->move != 'S' && tr->move != 'R') {
-      LOG("ERROR: Move %c @ %d:%c is invalid!\n", tr->move, state->number, input);
-    }
-  #endif
+  tr_output_t * tr_out = NULL;
+  tr_input_t * tr_in = NULL;
 
-  /* Update input_chars_count */
-  if (state->tr_inputs[(unsigned char)input] == NULL) {
-    state->tr_inputs_count++;
+  /* First create the transition */
+  tr_out = (tr_output_t *) malloc(sizeof(tr_output_t));
+  tr_out->state = q_out;
+  tr_out->output = output;
+  tr_out->move = move;
+
+  if (s->tr_inputs_count == 0) {
+    /* Insert the first element */
+    s->tr_inputs = (tr_input_t *) malloc(sizeof(tr_input_t));
+    s->tr_inputs_count++;
+    tr_in = s->tr_inputs;
+
+    /* Then set up the new entry */
+    tr_in->input = input;
+    tr_in->transitions = NULL;
+  } else {
+    /* Look if the input transition already exists */
+    tr_in = search_tr_input(s->tr_inputs, 0, s->tr_inputs_count-1, input);
+
+    /* If it does not exist, extend the array by one */
+    if (tr_in == NULL) {
+      s->tr_inputs_count++;
+      s->tr_inputs = (tr_input_t *)
+                realloc(s->tr_inputs, s->tr_inputs_count * sizeof(tr_input_t));
+      /* Determine where the new element must be inserted, while shifting
+          entries above it up by one */
+      tr_in = &s->tr_inputs[s->tr_inputs_count - 1]; /* Begin from the last entry */
+      while (tr_in != s->tr_inputs && (tr_in-1)->input > input) {
+        /* Shift the entry up */
+        tr_in->input = (tr_in-1)->input;
+        tr_in->transitions = (tr_in-1)->transitions;
+        tr_in--;
+      }
+
+      /* Then set up the new entry */
+      tr_in->input = input;
+      tr_in->transitions = NULL;
+    }
   }
 
-  /* Then insert it in the transitions array, at the head of the list */
-  tr->next = state->tr_inputs[(unsigned char)input];
-  state->tr_inputs[(unsigned char)input] = tr;
-
-  return;
+  /* Insert the new transition at the head of the list */
+  tr_out->next = tr_in->transitions;
+  tr_in->transitions = tr_out;
 }
 
 /* Creates and initialises a memory page */
@@ -596,7 +476,7 @@ void branch_destroy(branch_t * branch) {
 }
 
 /* Return output transition list */
-tr_output_t * search_tr_out(tr_input_t * v, int p, int r, char key) {
+tr_input_t * search_tr_input(tr_input_t * v, int p, int r, char key) {
   if (r < p || key < v[p].input || key > v[r].input) {
     return NULL;
   }
@@ -604,7 +484,7 @@ tr_output_t * search_tr_out(tr_input_t * v, int p, int r, char key) {
     /* Use linear search */
     while(p <= r) {
       if (v[p].input == key) {
-        return v[p].transitions;
+        return &v[p];
       }
       p++;
     }
@@ -613,12 +493,12 @@ tr_output_t * search_tr_out(tr_input_t * v, int p, int r, char key) {
     /* Binary search */
     int mid = p + (r - p)/2;
     if (v[mid].input == key) {
-      return v[mid].transitions;
+      return &v[mid];
     }
     if(v[mid].input > key) {
-      return search_tr_out(v, p, mid - 1, key); /* First half */
+      return search_tr_input(v, p, mid - 1, key); /* First half */
     } else {
-      return search_tr_out(v, mid + 1 , r, key); /* Second half */
+      return search_tr_input(v, mid + 1 , r, key); /* Second half */
     }
   }
 }
@@ -720,6 +600,7 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
   branch_t * b_child;
   state_t * s = NULL;
   tr_output_t * tr_next;
+  tr_input_t * tr_in;
   char input;
 
   /* Execute given transition */
@@ -744,7 +625,8 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
   /* Look for the next transition(s) */
   s = b->state; /* Save current state */
   input = head_read(b); /* Read input */
-  tr_next = search_tr_out(s->tr_inputs, 0, s->tr_inputs_count - 1, input);
+  tr_in = search_tr_input(s->tr_inputs, 0, s->tr_inputs_count - 1, input);
+  tr_next = tr_in == NULL ? NULL : tr_in->transitions;
 
   if (tr_next == NULL) { /* Machine needs to halt */
     LOG("DEBUG: Reached halt state\n");
