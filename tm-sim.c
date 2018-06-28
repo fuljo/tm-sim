@@ -10,7 +10,7 @@
 #include <stdbool.h>
 
 #define STR_LEN 4
-#define PAGE_SIZE 512
+#define PAGE_SIZE 256
 #define MAX_SIZE_LINEAR_SEARCH 4
 #define INITIAL_STATE 0
 #define BLANK '_'
