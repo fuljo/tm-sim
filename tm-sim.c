@@ -71,7 +71,7 @@ typedef struct turing_machine tm_t;
 /* Structure for general turing machine information */
 struct turing_machine {
   int max_state; /* Highest state number */
-  int max_steps; /* Maximum steps per-branch */
+  long int max_steps; /* Maximum steps per-branch */
   rq_t * rq; /* Top of runqueue */
   state_t * states; /* [0...max_state] vector */
 };
@@ -107,7 +107,7 @@ struct branch {
   tr_output_t * tr; /* Transition to be executed by tm_step */
   page_t * head_page; /* TM Head page */
   int head_pos; /* Position on current page (0...PAGE_SIZE-1)*/
-  int steps; /* Number of transitions from the root of the tree */
+  long int steps; /* Number of transitions from the root of the tree */
 
   /* Keep track of the extreme points of the tape for garbage collection */
   page_t * first_page;
@@ -189,11 +189,11 @@ int main() {
   /* 4. Load max steps */
   reads = scanf("%s", s); /* Read the "max" string */
   getchar(); /* Flush endline */
-  reads = scanf("%d", &tm.max_steps); /* Read max steps number */
+  reads = scanf("%ld", &tm.max_steps); /* Read max steps number */
   if (reads) getchar(); /* Flush endline */
 
   /* 5. Simulate on input */
-  reads = scanf("%s", s); /* Read the "max" string */
+  reads = scanf("%s", s); /* Read the "run" string */
   getchar(); /* Flush endline */
   while ((res = getchar()) != EOF) {
     ungetc(res, stdin);
@@ -507,6 +507,7 @@ tr_input_t * search_tr_input(tr_input_t * v, int p, int r, char key) {
 char tm_run(tm_t * tm) {
   branch_t *root, *b;
   char c;
+  long int reads = 0;
 
   /* 1. Create the "root" branch */
   root = malloc(sizeof(branch_t));
@@ -525,10 +526,14 @@ char tm_run(tm_t * tm) {
 
   /* 2. Load the input string */
   c = getchar();
-  while (c != '\n' && c != EOF) { /* Read the string till the end */
-    head_write(root, c);
-    head_move(root, 'R');
+  while (c != '\n' && c != EOF) {
+    /* Read the string till the end */
+    if (reads <= tm->max_steps) {
+      head_write(root, c);
+      head_move(root, 'R');
+    }
     c = getchar();
+    reads++;
   }
   /* Reset head's position */
   root->head_page = root->first_page;
