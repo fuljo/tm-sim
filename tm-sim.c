@@ -27,14 +27,10 @@
         b->tr->state, b->tr->output, b->tr->move);\
     }\
   }
-  #define LOG_TAPE(branch) {\
-    branch_t * b = branch;\
+  #define LOG_TAPE(b) {\
     if(b->tr != NULL) {\
       printf("TAPE: ");\
-      if (b->nd_parent != NULL) {\
-        b = b->nd_parent;\
-      }\
-      page_t * p = b->first_page;\
+      page_t * p = b->tape->first_page;\
       int i = 0;\
       while (p != NULL) {\
         printf("%c", p->mem[i]);\
@@ -53,7 +49,7 @@
 # else
   #define LOG(args...)
   #define LOG_STATUS(tm, b)
-  #define LOG_TAPE(tm)
+  #define LOG_TAPE(b)
 #endif
 
 /**
@@ -61,8 +57,8 @@
   */
 
 typedef struct page page_t;
+typedef struct tape tape_t;
 typedef struct branch branch_t;
-typedef struct runqueue rq_t;
 typedef struct tr_output tr_output_t;
 typedef struct tr_input tr_input_t;
 typedef struct state state_t;
@@ -72,7 +68,7 @@ typedef struct turing_machine tm_t;
 struct turing_machine {
   int max_state; /* Highest state number */
   long int max_steps; /* Maximum steps per-branch */
-  rq_t * rq; /* Top of runqueue */
+  branch_t * rq; /* Top of runqueue */
   state_t * states; /* [0...max_state] vector */
 };
 
@@ -102,28 +98,26 @@ struct tr_output {
 
 /* Structure for computation branches */
 struct branch {
-  branch_t * nd_parent; /* Pointer to parent branch if memory needs to be copied */
   state_t * state; /* Current state */
   tr_output_t * tr; /* Transition to be executed by tm_step */
   page_t * head_page; /* TM Head page */
   int head_pos; /* Position on current page (0...PAGE_SIZE-1)*/
   long int steps; /* Number of transitions from the root of the tree */
+  tape_t * tape;
 
-  /* Keep track of the extreme points of the tape for garbage collection */
-  page_t * first_page;
+  branch_t * next; /* Next branch in the runqueue */
 };
 
 /* Structure for memory page */
 struct page {
-  bool private; /* Does the page belong to the current branch? */
   page_t *prev, *next; /* Linked list */
-  char * mem; /* Actual memory of PAGE_SIZE */
+  char mem[PAGE_SIZE]; /* Actual memory of PAGE_SIZE */
 };
 
-/* Branch runqueue element */
-struct runqueue {
-  rq_t * next;
-  branch_t * branch;
+/* Structure for the memory tape */
+struct tape {
+  int ref_count; /* Number of branches sharing this tape */
+  page_t * first_page;
 };
 
 /* FUNCTION PROTOTYPES */
@@ -139,20 +133,18 @@ void state_insert_transition(
   char move
 );
 
-page_t * page_create(page_t * prev, page_t * next, bool private, char * mem);
-void page_destroy(page_t * page);
-void page_make_private(page_t * page);
+page_t * page_create(page_t * prev, page_t * next, char * mem);
 
 branch_t * branch_clone(branch_t * parent, tr_output_t * tr);
-void branch_memcpy(branch_t * branch, branch_t * parent);
+void tape_make_private(branch_t * branch);
 void branch_destroy(branch_t * branch);
 
 char head_read(branch_t * b);
 void head_write (branch_t * b, char c);
 void head_move(branch_t * b, char c);
 
-void rq_push(rq_t ** rq, branch_t * b);
-branch_t * rq_pop(rq_t ** rq);
+void rq_enqueue(branch_t ** rq, branch_t * b);
+branch_t * rq_dequeue(branch_t ** rq);
 
 void load_transitions(tm_t * tm);
 void load_acc(tm_t * tm);
@@ -367,41 +359,22 @@ void state_insert_transition(
 }
 
 /* Creates and initialises a memory page */
-page_t * page_create(page_t * prev, page_t * next, bool private, char * mem) {
-  LOG("DEBUG: Creating new page: %p\t%p\t%d\n", prev, next, private);
+page_t * page_create(page_t * prev, page_t * next, char * mem) {
+  LOG("DEBUG: Creating new page: %p\t%p\n", prev, next);
   page_t * p = (page_t *) malloc(sizeof(page_t));
   p->prev = prev;
   p->next = next;
-  p->private = private;
-  /* If no memory to copy is given, allocate new one */
-  if (mem == NULL) {
-    mem = (char *) malloc(PAGE_SIZE * sizeof(char));
-    /* TODO: Do not initalise memory and use garbage collector */
+
+  if (mem == NULL) { /* If no memory to copy is given, intialize new one */
     for (int i = 0; i < PAGE_SIZE; i++) {
-      mem[i] = BLANK;
+      p->mem[i] = BLANK;
+    }
+  } else { /* Copy the memory, char by char */
+    for (int i = 0; i < PAGE_SIZE; i++) {
+      p->mem[i] = mem[i];
     }
   }
-  p->mem = mem;
   return p;
-}
-
-/* Clears out a page */
-void page_destroy(page_t * page) {
-  free(page->mem);
-  free(page);
-}
-
-/* Copy the page's shared memory to a new private memory */
-void page_make_private(page_t * page) {
-  LOG("DEBUG: Making private page\n");
-  char * old_mem = page->mem;
-  page->mem = (char *) malloc(PAGE_SIZE * sizeof(char));
-  page->private = true;
-
-  /* Copy the memory content */
-  for(int i=0; i < PAGE_SIZE; i++) {
-    page->mem[i] = old_mem[i];
-  }
 }
 
 /* Creates a new branch from its parent, does not duplicate memory */
@@ -412,43 +385,43 @@ branch_t * branch_clone(branch_t * parent, tr_output_t * tr) {
   b = (branch_t *) malloc(sizeof(branch_t));
 
   /* Copy static variables */
-  b->nd_parent = parent;
   b->state = parent->state;
   b->head_pos = parent->head_pos;
   b->steps = parent->steps;
   b->tr = tr;
 
-  /* Initialise memory to NULL, it will be derived from parent when branch
-      is evaluated */
-  b->first_page = NULL;
-  b->head_page = NULL;
+  /* Share memory with parent */
+  b->tape = parent->tape;
+  b->tape->ref_count++;
+  b->head_page = parent->head_page;
 
   return b;
 }
 
-/* Copies branch pages from parent, the memory remains shared */
-void branch_memcpy(branch_t * branch, branch_t * parent) {
+/* Makes a private copy of the tape */
+void tape_make_private(branch_t * branch) {
+  tape_t * parent = branch->tape;
   page_t *p_parent, *p_child;
 
-  if (parent == NULL) {
-    /* Nothing to copy */
-    return;
-  }
+  /* Create a new tape descriptor */
+  branch->tape = (tape_t *) malloc(sizeof(tape_t));
+  branch->tape->ref_count = 1;
+  parent->ref_count--;
 
-  /* Copy memory descriptors */
+  /* Copy pages */
   p_parent = parent->first_page;
   p_child = NULL;
   while (p_parent != NULL) {
     /* Create new page with shared memory and insert it at the end of the list */
-    p_child = page_create(p_child, NULL, false, p_parent->mem);
+    p_child = page_create(p_child, NULL, p_parent->mem);
     if (p_child->prev != NULL) {
       p_child->prev->next = p_child; /* Link next to previous */
     } else {
-      branch->first_page = p_child; /* First page */
+      branch->tape->first_page = p_child; /* First page */
     }
 
     /* Set the same head page */
-    if (p_parent == parent->head_page) {
+    if (p_parent == branch->head_page) {
       branch->head_page = p_child;
     }
 
@@ -458,17 +431,23 @@ void branch_memcpy(branch_t * branch, branch_t * parent) {
 
 /* Destroy branch and deallocate memory */
 void branch_destroy(branch_t * branch) {
-  page_t *p, *p_next;
+  /* De-reference the tape */
+  branch->tape->ref_count--;
+  if (branch->tape->ref_count == 0) {
+    LOG("DEBUG: Clearing unreferenced tape\n");
+    /* If the tape isn't referenced by any branch, free it */
+    page_t *p, *p_next;
 
-  /* Delete page descriptors and private mem */
-  p = branch->first_page;
-  while (p != NULL) {
-    if (p->private) {
-      free(p->mem);
+    /* Delete pages */
+    p = branch->tape->first_page;
+    while (p != NULL) {
+      p_next = p->next;
+      free(p);
+      p = p_next;
     }
-    p_next = p->next;
-    free(p);
-    p = p_next;
+
+    /* Delete the tape descipror */
+    free(branch->tape);
   }
 
   /* Delete the branch itself */
@@ -510,13 +489,16 @@ char tm_run(tm_t * tm) {
   long int reads = 0;
 
   /* 1. Create the "root" branch */
-  root = malloc(sizeof(branch_t));
-  root->nd_parent = NULL;
+  root = (branch_t *) malloc(sizeof(branch_t));
   root->head_page = NULL; /* Will cause page fault */
-  root->first_page = NULL;
+  root->tape = (tape_t *) malloc(sizeof(tape_t));
+  root->tape->first_page = NULL;
+  root->tape->ref_count = 1;
   root->head_pos = 0;
   root->steps = 0;
   root->tr = NULL;
+  root->next = NULL;
+  /* TODO: Is this really useful? */
   if (tm->states != NULL) { /* Set initial state */
     root->state = &tm->states[INITIAL_STATE];
   } else {
@@ -527,7 +509,7 @@ char tm_run(tm_t * tm) {
   /* 2. Load the input string */
   c = getchar();
   while (c != '\n' && c != EOF) {
-    /* Read the string till the end */
+    /* Read the string till the end or max_steps */
     if (reads <= tm->max_steps) {
       head_write(root, c);
       head_move(root, 'R');
@@ -536,16 +518,16 @@ char tm_run(tm_t * tm) {
     reads++;
   }
   /* Reset head's position */
-  root->head_page = root->first_page;
+  root->head_page = root->tape->first_page;
   root->head_pos = 0;
 
   /* 3. Run the computation */
-  rq_push(&tm->rq, root);
+  rq_enqueue(&tm->rq, root);
   c = tm_compute_rq(tm);
 
   /* 4. Empty the runqueue */
   while(tm->rq != NULL) {
-    b = rq_pop(&tm->rq);
+    b = rq_dequeue(&tm->rq);
     branch_destroy(b);
   }
 
@@ -561,25 +543,24 @@ char tm_compute_rq(tm_t * tm) {
   bool has_preempted = false;
 
   while (tm->rq != NULL) {
-    b = tm->rq->branch; /* Branch to be executed */
+    b = rq_dequeue(&tm->rq); /* Branch to be executed */
 
     if (b->steps == tm->max_steps){ /* Check if preemption is needed */
       /* Preempt the branch */
-      rq_pop(&tm->rq);
       branch_destroy(b);
       has_preempted = true;
     } else { /* No preemption => execute transition */
-      LOG_STATUS(tm, tm->rq->branch);
-      LOG_TAPE(tm->rq->branch);
-      s = tm_step(tm, tm->rq->branch);
+      LOG_STATUS(tm, b);
+      LOG_TAPE(b);
+      s = tm_step(tm, b);
       if (s != NULL) { /* Machine halted in this state */
         if (s->tr_inputs_count == 0 && s->is_acc) { /* It is an acceptance state */
           LOG("INFO: Accepting...\n");
+          branch_destroy(b);
           return SYM_ACCEPT;
         } else { /* The transition is undefined */
           /* This branch has terminated */
           LOG("DEBUG: Dequeuing dead branch\n");
-          rq_pop(&tm->rq);
           branch_destroy(b);
         }
       }
@@ -594,12 +575,11 @@ char tm_compute_rq(tm_t * tm) {
   return has_preempted ? SYM_UNDET : SYM_REFUSE;
 }
 
-/** Takes in a branch from the queue, if needed copies memory from parent.
+/** Takes in a branch from the queue.
   * Then executes the given transition, if any.
   * Looks for the next transition, if it find none it returns the halt state,
   * else it returns NULL.
-  * If it finds more than one transition (non-deterministic case) it pushes
-  * them at the top of the runqueue.
+  * Re-enqueues the branch(es) with the next transition(s).
   */
 state_t * tm_step(tm_t * tm, branch_t * b) {
   branch_t * b_child;
@@ -613,12 +593,6 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
     LOG("DEBUG: Doing transition -> %d, %c, %c\n",
       b->tr->state, b->tr->output, b->tr->move);
     s = &tm->states[b->tr->state]; /* Save next state */
-
-    /* If we come from a non-deterministic transition, copy parent's memory */
-    if (b->nd_parent != NULL) {
-      branch_memcpy(b, b->nd_parent);
-      b->nd_parent = NULL; /* Reset non-determinism */
-    }
 
     /* Complete the transition */
     b->state = s;
@@ -640,6 +614,7 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
 
   /* Set the first transition as the next on this branch */
   b->tr = tr_next;
+  rq_enqueue(&tm->rq, b);
 
   /** If there are other (non-deterministic) transitions, they are
     * pushed on top of the first one, so they will be executed first
@@ -648,8 +623,8 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
     */
   tr_next = tr_next->next;
   while (tr_next != NULL) {
-    b_child = branch_clone(b, tr_next); /* Clone and set nd_parent */
-    rq_push(&tm->rq, b_child); /* Insert on top of runqueue */
+    b_child = branch_clone(b, tr_next); /* Clone with shared memory */
+    rq_enqueue(&tm->rq, b_child);
     tr_next = tr_next->next;
   }
 
@@ -677,13 +652,12 @@ void head_write(branch_t * b, char c) {
   if (b->head_page == NULL && c != BLANK) {
     LOG("DEBUG: Page fault, creating first page\n");
     /* If there is no page and we're not writing a blank, create the first one */
-    b->first_page = page_create(NULL, NULL, true, NULL);
-    b->head_page = b->first_page;
+    b->head_page = page_create(NULL, NULL, NULL);
+    b->tape->first_page = b->head_page;
   }
   if (b->head_page->mem[b->head_pos] != c) { /* Only write if different */
-    if (!b->head_page->private) {
-      /* If the page is shared, make a private copy of the memory */
-      page_make_private(b->head_page);
+    if (b->tape->ref_count > 1) { /* If the tape is shared, make it private */
+      tape_make_private(b);
     }
     /* Now write the char */
     b->head_page->mem[b->head_pos] = c;
@@ -692,13 +666,12 @@ void head_write(branch_t * b, char c) {
 
 /* Move the head L, S, R and handle page fault */
 void head_move(branch_t * b, char move) {
-  /* TODO: Set up garbage collector */
   if (b->head_page != NULL) {
     if (move == 'L') {
       if (b->head_page->prev == NULL && b->head_pos == 0) { /* Left page fault */
-        /* Create the new page an mark it private */
-        b->head_page->prev = page_create(NULL, b->head_page, true, NULL);
-        b->first_page = b->head_page->prev;
+        /* Create the new page */
+        b->head_page->prev = page_create(NULL, b->head_page, NULL);
+        b->tape->first_page = b->head_page->prev;
       }
       if (b->head_pos == 0) { /* Move to previous page */
         b->head_page = b->head_page->prev;
@@ -709,7 +682,7 @@ void head_move(branch_t * b, char move) {
     } else if (move == 'R') {
       if (b->head_page->next == NULL && b->head_pos == PAGE_SIZE - 1) { /* Right page fault */
         /* Create the new page an mark it private */
-        b->head_page->next = page_create(b->head_page, NULL, true, NULL);
+        b->head_page->next = page_create(b->head_page, NULL, NULL);
       }
       if (b->head_pos == PAGE_SIZE - 1) { /* Move to next page */
         b->head_page = b->head_page->next;
@@ -722,22 +695,18 @@ void head_move(branch_t * b, char move) {
 }
 
 /* Adds a branch on top of the runqueue */
-void rq_push(rq_t ** rq, branch_t * b) {
-  rq_t * new = malloc(sizeof(rq_t));
-  new->branch = b;
-  new->next = *rq;
-  *rq = new;
+void rq_enqueue(branch_t ** rq, branch_t * b) {
+  b->next = *rq;
+  *rq = b;
 }
 
 /* Removes a branch from the top of the runqueue and returns it */
-branch_t * rq_pop(rq_t ** rq) {
-  rq_t * elem;
+branch_t * rq_dequeue(branch_t ** rq) {
   branch_t * b;
   if (*rq != NULL) {
-    elem = *rq;
-    b = elem->branch;
-    *rq = (*rq)->next;
-    free(elem);
+    b = *rq;
+    *rq = b->next;
+    b->next = NULL;
     return b;
   } else {
     return NULL;
