@@ -9,8 +9,9 @@
 #include <limits.h>
 #include <stdbool.h>
 
+#define TR_SORTED false
 #define STR_LEN 4
-#define PAGE_SIZE 256
+#define PAGE_SIZE 128
 #define MAX_SIZE_LINEAR_SEARCH 4
 #define INITIAL_STATE 0
 #define BLANK '_'
@@ -121,11 +122,10 @@ struct tape {
 };
 
 /* FUNCTION PROTOTYPES */
-tm_t tm_create();
-void tm_destroy(tm_t * tm);
-void tm_insert_state(int q);
+inline tm_t tm_create();
+inline void tm_destroy(tm_t * tm);
 
-void state_insert_transition(
+inline void state_insert_transition(
   state_t * state,
   char input,
   int q_out,
@@ -133,28 +133,27 @@ void state_insert_transition(
   char move
 );
 
-page_t * page_create(page_t * prev, page_t * next, char * mem);
+inline page_t * page_create(page_t * prev, page_t * next, char * mem);
 
-branch_t * branch_clone(branch_t * parent, tr_output_t * tr);
-void tape_make_private(branch_t * branch);
-void branch_destroy(branch_t * branch);
+inline branch_t * branch_clone(branch_t * parent, tr_output_t * tr);
+inline void tape_make_private(branch_t * branch);
+inline void branch_destroy(branch_t * branch);
 
-char head_read(branch_t * b);
-void head_write (branch_t * b, char c);
-void head_move(branch_t * b, char c);
+inline char head_read(branch_t * b);
+inline void head_write (branch_t * b, char c);
+inline void head_move(branch_t * b, char c);
 
-void rq_enqueue(branch_t ** rq, branch_t * b);
-branch_t * rq_dequeue(branch_t ** rq);
+inline void rq_enqueue(branch_t ** rq, branch_t * b);
+inline branch_t * rq_dequeue(branch_t ** rq);
 
-void load_transitions(tm_t * tm);
-void load_acc(tm_t * tm);
-void load_string(branch_t * b);
+inline void load_transitions(tm_t * tm);
+inline void load_acc(tm_t * tm);
 
-char tm_run(tm_t * tm);
-char tm_compute_rq(tm_t * tm);
-state_t * tm_step(tm_t * tm, branch_t * b);
+inline char tm_run(tm_t * tm);
+inline char tm_compute_rq(tm_t * tm);
+inline state_t * tm_step(tm_t * tm, branch_t * b);
 
-tr_input_t * search_tr_input(tr_input_t * v, int p, int r, char key);
+inline tr_input_t * search_tr_input(tr_input_t * v, int p, int r, char key);
 
 /**
   * MAIN
@@ -340,11 +339,13 @@ void state_insert_transition(
       /* Determine where the new element must be inserted, while shifting
           entries above it up by one */
       tr_in = &s->tr_inputs[s->tr_inputs_count - 1]; /* Begin from the last entry */
-      while (tr_in != s->tr_inputs && (tr_in-1)->input > input) {
-        /* Shift the entry up */
-        tr_in->input = (tr_in-1)->input;
-        tr_in->transitions = (tr_in-1)->transitions;
-        tr_in--;
+      if (TR_SORTED) {
+        while (tr_in != s->tr_inputs && (tr_in-1)->input > input) {
+          /* Shift the entry up */
+          tr_in->input = (tr_in-1)->input;
+          tr_in->transitions = (tr_in-1)->transitions;
+          tr_in--;
+        }
       }
 
       /* Then set up the new entry */
@@ -456,10 +457,10 @@ void branch_destroy(branch_t * branch) {
 
 /* Return output transition list */
 tr_input_t * search_tr_input(tr_input_t * v, int p, int r, char key) {
-  if (r < p || key < v[p].input || key > v[r].input) {
+  if (TR_SORTED && (r < p || key < v[p].input || key > v[r].input)) {
     return NULL;
   }
-  if ((r - p) <= MAX_SIZE_LINEAR_SEARCH) {
+  if (!TR_SORTED || (r - p) <= MAX_SIZE_LINEAR_SEARCH) {
     /* Use linear search */
     while(p <= r) {
       if (v[p].input == key) {
