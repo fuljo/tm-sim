@@ -9,10 +9,8 @@
 #include <limits.h>
 #include <stdbool.h>
 
-#define TR_SORTED false
 #define STR_LEN 4
-#define PAGE_SIZE 128
-#define MAX_SIZE_LINEAR_SEARCH 4
+#define PAGE_SIZE 64
 #define INITIAL_STATE 0
 #define BLANK '_'
 #define SYM_ACCEPT '1'
@@ -69,14 +67,14 @@ typedef struct turing_machine tm_t;
 struct turing_machine {
   int max_state; /* Highest state number */
   long int max_steps; /* Maximum steps per-branch */
-  branch_t * rq; /* Top of runqueue */
+  branch_t * rq_head; /* Head of runqueue */
+  branch_t * rq_tail; /* Tail of runqueue */
   state_t * states; /* [0...max_state] vector */
 };
 
 /* Structure for state information */
 struct state {
   bool is_acc;
-  bool is_reachable; /* Does the state appear in the right part of any tr? */
   int tr_inputs_count;
   tr_input_t * tr_inputs; /* [0...tr_inputs_count] vector of
                               <input,tr_output> entries */
@@ -104,7 +102,7 @@ struct branch {
   page_t * head_page; /* TM Head page */
   int head_pos; /* Position on current page (0...PAGE_SIZE-1)*/
   long int steps; /* Number of transitions from the root of the tree */
-  tape_t * tape;
+  tape_t * tape; /* The tape, which may be shared with other branches */
 
   branch_t * next; /* Next branch in the runqueue */
 };
@@ -143,8 +141,8 @@ inline char head_read(branch_t * b);
 inline void head_write (branch_t * b, char c);
 inline void head_move(branch_t * b, char c);
 
-inline void rq_enqueue(branch_t ** rq, branch_t * b);
-inline branch_t * rq_dequeue(branch_t ** rq);
+inline void rq_enqueue(tm_t * tm, branch_t * b);
+inline branch_t * rq_dequeue(tm_t * tm);
 
 inline void load_transitions(tm_t * tm);
 inline void load_acc(tm_t * tm);
@@ -188,11 +186,11 @@ int main() {
   getchar(); /* Flush endline */
   while ((res = getchar()) != EOF) {
     ungetc(res, stdin);
-    res = tm_run(&tm);
+    res = tm_run(&tm); /* RUN SIMULATION */
     printf("%c\n", res);
   }
 
-  /* 6. Clean memory */
+  /* 6. Clear memory */
   tm_destroy(&tm);
   return 0;
 }
@@ -202,7 +200,8 @@ tm_t tm_create() {
   tm_t tm;
   tm.max_state = 0;
   tm.max_steps = 0;
-  tm.rq = NULL;
+  tm.rq_head = NULL;
+  tm.rq_tail = NULL;
   tm.states = (state_t *) malloc(sizeof(state_t)); /* Initial state */
   tm.states[0].tr_inputs_count = 0;
   tm.states[0].tr_inputs = NULL;
@@ -238,14 +237,11 @@ void tm_destroy(tm_t * tm) {
 }
 
 /** Loads the transitions from stdin:
-  *  - first it puts them in a temporary structure: states are sorted in
-  *    a double-linked list. Each state hold a 256-cell array which stores
-  *    the output transitions for each input char.
-  *  - determines the number of states and the number of different
-  *    input characters for each state
-  *  - then allocates an array for the states, indexed by state number.
-  *    For each state it allocates an array of tr_input structs, sorted by
-  *    input char, which link to their output transitions
+  *  - states are stored in array, indexed with the state number;
+  *    it gets expanded when new states are found.
+  *  - each state holds an array of tr_input structs, each representing
+  *    an input char with associated transition(s); ita also gets expanded
+  *  - each tr_input holds a list of (at least one) output transition(s)
   *  The expected transition format is:
   *  "(state) (input) (output) (move) (next state)"
   */
@@ -283,24 +279,6 @@ void load_transitions(tm_t* tm) {
   LOG("INFO: Max state: %d\n", tm->max_state);
 }
 
-/* Loads acceptance states */
-void load_acc(tm_t * tm) {
-  int q, reads;
-  LOG("INFO: Acceptance states: ");
-  do {
-    reads = scanf("%d", &q);
-    if (reads) {
-      getchar(); /* Flush endline */
-      LOG("%d, ", q);
-      if (q <= tm->max_state) {
-        tm->states[q].is_acc = true;
-      } /* If the state is not in the list it would be unreachable */
-    }
-  } while(reads != 0);
-  LOG("\n");
-  return;
-}
-
 /* Adds transition to an existing state during input parsing */
 void state_insert_transition(
   state_t * s,
@@ -336,17 +314,8 @@ void state_insert_transition(
       s->tr_inputs_count++;
       s->tr_inputs = (tr_input_t *)
                 realloc(s->tr_inputs, s->tr_inputs_count * sizeof(tr_input_t));
-      /* Determine where the new element must be inserted, while shifting
-          entries above it up by one */
+      /* Insert the new element at the end */
       tr_in = &s->tr_inputs[s->tr_inputs_count - 1]; /* Begin from the last entry */
-      if (TR_SORTED) {
-        while (tr_in != s->tr_inputs && (tr_in-1)->input > input) {
-          /* Shift the entry up */
-          tr_in->input = (tr_in-1)->input;
-          tr_in->transitions = (tr_in-1)->transitions;
-          tr_in--;
-        }
-      }
 
       /* Then set up the new entry */
       tr_in->input = input;
@@ -359,6 +328,24 @@ void state_insert_transition(
   tr_in->transitions = tr_out;
 }
 
+/* Loads acceptance states */
+void load_acc(tm_t * tm) {
+  int q, reads;
+  LOG("INFO: Acceptance states: ");
+  do {
+    reads = scanf("%d", &q);
+    if (reads) {
+      getchar(); /* Flush endline */
+      LOG("%d, ", q);
+      if (q <= tm->max_state) {
+        tm->states[q].is_acc = true;
+      } /* If the state is not in the list it would be unreachable */
+    }
+  } while(reads != 0);
+  LOG("\n");
+  return;
+}
+
 /* Creates and initialises a memory page */
 page_t * page_create(page_t * prev, page_t * next, char * mem) {
   LOG("DEBUG: Creating new page: %p\t%p\n", prev, next);
@@ -366,7 +353,7 @@ page_t * page_create(page_t * prev, page_t * next, char * mem) {
   p->prev = prev;
   p->next = next;
 
-  if (mem == NULL) { /* If no memory to copy is given, intialize new one */
+  if (mem == NULL) { /* If no memory to copy is given, intialize blank one */
     for (int i = 0; i < PAGE_SIZE; i++) {
       p->mem[i] = BLANK;
     }
@@ -378,7 +365,7 @@ page_t * page_create(page_t * prev, page_t * next, char * mem) {
   return p;
 }
 
-/* Creates a new branch from its parent, does not duplicate memory */
+/* Creates a new branch from its parent, the memory is shared */
 branch_t * branch_clone(branch_t * parent, tr_output_t * tr) {
   branch_t * b;
 
@@ -399,7 +386,7 @@ branch_t * branch_clone(branch_t * parent, tr_output_t * tr) {
   return b;
 }
 
-/* Makes a private copy of the tape */
+/* Makes a private copy of the tape, in a copy-on-write fashion */
 void tape_make_private(branch_t * branch) {
   tape_t * parent = branch->tape;
   page_t *p_parent, *p_child;
@@ -413,7 +400,7 @@ void tape_make_private(branch_t * branch) {
   p_parent = parent->first_page;
   p_child = NULL;
   while (p_parent != NULL) {
-    /* Create new page with shared memory and insert it at the end of the list */
+    /* Copy each page's memory */
     p_child = page_create(p_child, NULL, p_parent->mem);
     if (p_child->prev != NULL) {
       p_child->prev->next = p_child; /* Link next to previous */
@@ -457,30 +444,14 @@ void branch_destroy(branch_t * branch) {
 
 /* Return output transition list */
 tr_input_t * search_tr_input(tr_input_t * v, int p, int r, char key) {
-  if (TR_SORTED && (r < p || key < v[p].input || key > v[r].input)) {
-    return NULL;
+  /* Sequential search has proven to be faster in tests */
+  while(p <= r) {
+    if (v[p].input == key) {
+      return &v[p];
+    }
+    p++;
   }
-  if (!TR_SORTED || (r - p) <= MAX_SIZE_LINEAR_SEARCH) {
-    /* Use linear search */
-    while(p <= r) {
-      if (v[p].input == key) {
-        return &v[p];
-      }
-      p++;
-    }
-    return NULL;
-  } else {
-    /* Binary search */
-    int mid = p + (r - p)/2;
-    if (v[mid].input == key) {
-      return &v[mid];
-    }
-    if(v[mid].input > key) {
-      return search_tr_input(v, p, mid - 1, key); /* First half */
-    } else {
-      return search_tr_input(v, mid + 1 , r, key); /* Second half */
-    }
-  }
+  return NULL;
 }
 
 /* Computes one string from stdin and returns the response 0, 1, U */
@@ -498,14 +469,7 @@ char tm_run(tm_t * tm) {
   root->head_pos = 0;
   root->steps = 0;
   root->tr = NULL;
-  root->next = NULL;
-  /* TODO: Is this really useful? */
-  if (tm->states != NULL) { /* Set initial state */
-    root->state = &tm->states[INITIAL_STATE];
-  } else {
-    LOG("ERROR: The machine has no states");
-    return SYM_REFUSE;
-  }
+  root->state = &tm->states[INITIAL_STATE];
 
   /* 2. Load the input string */
   c = getchar();
@@ -523,12 +487,12 @@ char tm_run(tm_t * tm) {
   root->head_pos = 0;
 
   /* 3. Run the computation */
-  rq_enqueue(&tm->rq, root);
+  rq_enqueue(tm, root);
   c = tm_compute_rq(tm);
 
   /* 4. Empty the runqueue */
-  while(tm->rq != NULL) {
-    b = rq_dequeue(&tm->rq);
+  while(tm->rq_head != NULL) {
+    b = rq_dequeue(tm);
     branch_destroy(b);
   }
 
@@ -536,15 +500,17 @@ char tm_run(tm_t * tm) {
   return c;
 }
 
-/* Execute the runqueue until it's empty or a final state is reached */
-/* Return code: 0: refuse, 1: accept, U: undetermined */
+/** Execute the runqueue until it's empty or a final state is reached.
+  * The execution strategy is simple a Breadth-First approach.
+  * Return code: 0: refuse, 1: accept, U: undetermined
+  */
 char tm_compute_rq(tm_t * tm) {
   branch_t * b;
   state_t * s;
   bool has_preempted = false;
 
-  while (tm->rq != NULL) {
-    b = rq_dequeue(&tm->rq); /* Branch to be executed */
+  while (tm->rq_head != NULL) {
+    b = rq_dequeue(tm); /* Branch to be executed */
 
     if (b->steps == tm->max_steps){ /* Check if preemption is needed */
       /* Preempt the branch */
@@ -615,7 +581,7 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
 
   /* Set the first transition as the next on this branch */
   b->tr = tr_next;
-  rq_enqueue(&tm->rq, b);
+  rq_enqueue(tm, b);
 
   /** If there are other (non-deterministic) transitions, they are
     * pushed on top of the first one, so they will be executed first
@@ -625,7 +591,7 @@ state_t * tm_step(tm_t * tm, branch_t * b) {
   tr_next = tr_next->next;
   while (tr_next != NULL) {
     b_child = branch_clone(b, tr_next); /* Clone with shared memory */
-    rq_enqueue(&tm->rq, b_child);
+    rq_enqueue(tm, b_child);
     tr_next = tr_next->next;
   }
 
@@ -646,7 +612,7 @@ char head_read(branch_t * b) {
 
 /** Write given char in the cell under the head.
   * also handles page fault if there is no page allocated
-  * and makes a page private if needed
+  * and makes the tape private if needed (copy-on-write)
   */
 void head_write(branch_t * b, char c) {
   /* First check if any page is allocated */
@@ -667,8 +633,21 @@ void head_write(branch_t * b, char c) {
 
 /* Move the head L, S, R and handle page fault */
 void head_move(branch_t * b, char move) {
-  if (b->head_page != NULL) {
-    if (move == 'L') {
+  if (b->head_page == NULL || move == 'S') { /* If there is no page allocated, just do nothing */
+    return;
+  } else {
+    if (move == 'R') {
+      if (b->head_page->next == NULL && b->head_pos == PAGE_SIZE - 1) { /* Right page fault */
+        /* Create the new page an mark it private */
+        b->head_page->next = page_create(b->head_page, NULL, NULL);
+      }
+      if (b->head_pos == PAGE_SIZE - 1) { /* Move to next page */
+        b->head_page = b->head_page->next;
+        b->head_pos = 0;
+      } else { /* Just increment the position */
+        b->head_pos++;
+      }
+    } else if (move == 'L') {
       if (b->head_page->prev == NULL && b->head_pos == 0) { /* Left page fault */
         /* Create the new page */
         b->head_page->prev = page_create(NULL, b->head_page, NULL);
@@ -680,34 +659,31 @@ void head_move(branch_t * b, char move) {
       } else { /* Just decrement the position */
         b->head_pos--;
       }
-    } else if (move == 'R') {
-      if (b->head_page->next == NULL && b->head_pos == PAGE_SIZE - 1) { /* Right page fault */
-        /* Create the new page an mark it private */
-        b->head_page->next = page_create(b->head_page, NULL, NULL);
-      }
-      if (b->head_pos == PAGE_SIZE - 1) { /* Move to next page */
-        b->head_page = b->head_page->next;
-        b->head_pos = 0;
-      } else { /* Just increment the position */
-        b->head_pos++;
-      }
     }
-  } /* If there is no page allocated, just do nothing */
+  }
 }
 
-/* Adds a branch on top of the runqueue */
-void rq_enqueue(branch_t ** rq, branch_t * b) {
-  b->next = *rq;
-  *rq = b;
+/* Inserts a branch at the end of the runqueue */
+void rq_enqueue(tm_t * tm, branch_t * b) {
+  b->next = NULL;
+  if (tm->rq_tail != NULL) { /* The queue is non-empty */
+    tm->rq_tail->next = b;
+    tm->rq_tail = b;
+  } else { /* The queue is empty */
+    tm->rq_head = b;
+    tm->rq_tail = b;
+  }
 }
 
-/* Removes a branch from the top of the runqueue and returns it */
-branch_t * rq_dequeue(branch_t ** rq) {
+/* Removes a branch from the head of the runqueue and returns it */
+branch_t * rq_dequeue(tm_t * tm) {
   branch_t * b;
-  if (*rq != NULL) {
-    b = *rq;
-    *rq = b->next;
-    b->next = NULL;
+  if (tm->rq_head != NULL) {
+    b = tm->rq_head;
+    tm->rq_head = b->next;
+    if(tm->rq_head == NULL) {
+      tm->rq_tail = NULL;
+    }
     return b;
   } else {
     return NULL;
